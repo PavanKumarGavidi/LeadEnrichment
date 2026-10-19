@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
-const APOLLO_API_KEY = 'UhKB7c0hM4t2Ep1ihvRBRg';
+const ENRICHLOOPS_API_KEY = 'ek_8d4895a40ac852a80d4a511a2a9e8c3adffe7e8e4c62b964';
+const ENRICHLOOPS_BASE_URL = 'https://api.enrichloops.com/v1';
 const TEAM_PASSWORD = 'demo123';
 
 // ─── Personal/free email domains ─────────────────────────────────────────────
@@ -43,6 +44,7 @@ interface PersonData {
   location: string | null;
   avatar: string | null;
   github: string | null;
+  headline: string | null;
 }
 
 interface CompanyData {
@@ -50,8 +52,7 @@ interface CompanyData {
   website: string | null;
   industry: string | null;
   employees: string | null;
-  revenue: string | null;
-  revenueValue: number | null;
+  employeeRange: string | null;
   linkedin: string | null;
   location: string | null;
   logo: string | null;
@@ -71,13 +72,122 @@ interface EnrichResult {
   sources: string[];
 }
 
-// ─── FREE DATA SOURCES (CORS-friendly) ───────────────────────────────────────
+// ─── Enrichloops API helpers ─────────────────────────────────────────────────
 
-// 1. Gravatar - Get profile picture from email
+async function enrichloopsRequest(endpoint: string, body: any): Promise<any> {
+  try {
+    const res = await fetch(`${ENRICHLOOPS_BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${ENRICHLOOPS_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
+    });
+    
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      throw new Error(error.message || `API error: ${res.status}`);
+    }
+    
+    return await res.json();
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      throw new Error('Request timeout');
+    }
+    throw err;
+  }
+}
+
+async function pollTask(taskId: string, maxAttempts = 30): Promise<any> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(`${ENRICHLOOPS_BASE_URL}/tasks/${taskId}`, {
+        headers: {
+          'Authorization': `Bearer ${ENRICHLOOPS_API_KEY}`,
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      
+      if (!res.ok) {
+        throw new Error(`Task poll failed: ${res.status}`);
+      }
+      
+      const data = await res.json();
+      
+      if (data.task?.status === 'succeeded') {
+        return data;
+      }
+      
+      if (data.task?.status === 'failed') {
+        throw new Error(data.error?.message || 'Enrichment failed');
+      }
+      
+      // Still processing, wait 2 seconds
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    } catch (err: any) {
+      if (i === maxAttempts - 1) {
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+  
+  throw new Error('Task polling timeout');
+}
+
+async function enrichCompany(domain: string): Promise<any> {
+  try {
+    const response = await enrichloopsRequest('/companies/enrich', { domain });
+    
+    if (response.task?.status === 'succeeded') {
+      return response.data;
+    }
+    
+    if (response.task?.id) {
+      const result = await pollTask(response.task.id);
+      return result.data;
+    }
+    
+    return null;
+  } catch (err) {
+    console.error('Company enrichment error:', err);
+    return null;
+  }
+}
+
+async function enrichPerson(email: string, fullName?: string): Promise<any> {
+  try {
+    const body: any = { email };
+    if (fullName) {
+      body.fullName = fullName;
+    }
+    
+    const response = await enrichloopsRequest('/people/enrich', body);
+    
+    if (response.task?.status === 'succeeded') {
+      return response.data;
+    }
+    
+    if (response.task?.id) {
+      const result = await pollTask(response.task.id);
+      return result.data;
+    }
+    
+    return null;
+  } catch (err) {
+    console.error('Person enrichment error:', err);
+    return null;
+  }
+}
+
+// ─── FREE FALLBACK DATA SOURCES ──────────────────────────────────────────────
+
 async function getGravatar(email: string): Promise<string | null> {
   try {
-    const hash = await crypto.subtle.digest('MD5', new TextEncoder().encode(email.trim().toLowerCase()));
-    const hashArray = Array.from(new Uint8Array(hash));
+    const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(email.trim().toLowerCase()));
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     return `https://www.gravatar.com/avatar/${hashHex}?d=404`;
   } catch {
@@ -85,7 +195,6 @@ async function getGravatar(email: string): Promise<string | null> {
   }
 }
 
-// 2. GitHub API - Find person by name
 async function searchGitHub(name: string): Promise<any> {
   try {
     const res = await fetch(`https://api.github.com/search/users?q=${encodeURIComponent(name)}&per_page=1`, {
@@ -95,7 +204,6 @@ async function searchGitHub(name: string): Promise<any> {
     const data = await res.json();
     if (data.items && data.items.length > 0) {
       const user = data.items[0];
-      // Get full profile
       const profileRes = await fetch(user.url, { signal: AbortSignal.timeout(5000) });
       if (profileRes.ok) {
         return await profileRes.json();
@@ -107,7 +215,6 @@ async function searchGitHub(name: string): Promise<any> {
   }
 }
 
-// 3. Wikipedia API - Get company info
 async function searchWikipedia(companyName: string): Promise<any> {
   try {
     const res = await fetch(
@@ -116,58 +223,6 @@ async function searchWikipedia(companyName: string): Promise<any> {
     );
     if (!res.ok) return null;
     return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// 4. DuckDuckGo Instant Answer API - Company info
-async function searchDuckDuckGo(query: string): Promise<any> {
-  try {
-    const res = await fetch(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// 5. Apollo API (via proxy if available)
-async function lookupApollo(name: string, email: string): Promise<any> {
-  try {
-    const res = await fetch('https://api.apollo.io/api/v1/people/match', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': APOLLO_API_KEY,
-      },
-      body: JSON.stringify({ name, email }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.person || null;
-  } catch {
-    return null;
-  }
-}
-
-// 6. Apollo Company lookup
-async function lookupApolloCompany(domain: string): Promise<any> {
-  try {
-    const res = await fetch(
-      `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`,
-      {
-        headers: { 'x-api-key': APOLLO_API_KEY },
-        signal: AbortSignal.timeout(8000),
-      }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.organization || null;
   } catch {
     return null;
   }
@@ -182,52 +237,52 @@ async function enrichLead(name: string, email: string): Promise<EnrichResult> {
   const cachedCompany = getCachedCompany(domain);
   
   // Run all lookups in parallel
-  const [gravatar, github, wikipedia, duckduckgo, apolloPerson, apolloCompany] = await Promise.all([
+  const [enrichloopsPerson, enrichloopsCompany, gravatar, github, wikipedia] = await Promise.all([
+    enrichPerson(email, name),
+    cachedCompany ? Promise.resolve(null) : enrichCompany(domain),
     getGravatar(email),
     searchGitHub(name),
     cachedCompany ? Promise.resolve(null) : searchWikipedia(domain.split('.')[0]),
-    cachedCompany ? Promise.resolve(null) : searchDuckDuckGo(domain.split('.')[0]),
-    lookupApollo(name, email),
-    cachedCompany !== undefined ? Promise.resolve(cachedCompany) : lookupApolloCompany(domain),
   ]);
   
-  // Build person data
+  // Build person data (prioritize Enrichloops)
   let person: PersonData | null = null;
-  if (apolloPerson || github) {
-    sources.push(apolloPerson ? 'Apollo' : 'GitHub');
+  if (enrichloopsPerson || github) {
+    sources.push(enrichloopsPerson ? 'Enrichloops' : 'GitHub');
+    
+    const currentPosition = enrichloopsPerson?.positions?.find((p: any) => p.is_current);
+    
     person = {
-      name: apolloPerson?.name || github?.name || name,
-      title: apolloPerson?.title || github?.company || null,
-      seniority: apolloPerson?.seniority || null,
-      linkedin: apolloPerson?.linkedin_url || null,
-      location: apolloPerson 
-        ? [apolloPerson.city, apolloPerson.state, apolloPerson.country].filter(Boolean).join(', ')
-        : github?.location || null,
+      name: enrichloopsPerson?.full_name || github?.name || name,
+      title: currentPosition?.title || enrichloopsPerson?.headline || github?.company || null,
+      seniority: null, // Enrichloops doesn't provide this directly
+      linkedin: enrichloopsPerson?.linkedin_url || null,
+      location: currentPosition?.location || github?.location || null,
       avatar: gravatar || github?.avatar_url || null,
       github: github?.html_url || null,
+      headline: enrichloopsPerson?.headline || null,
     };
   }
   
-  // Build company data
+  // Build company data (prioritize Enrichloops)
   let company: CompanyData | null = null;
-  if (apolloCompany || wikipedia || duckduckgo) {
-    sources.push(apolloCompany ? 'Apollo' : wikipedia ? 'Wikipedia' : 'DuckDuckGo');
+  if (enrichloopsCompany || wikipedia) {
+    sources.push(enrichloopsCompany ? 'Enrichloops' : 'Wikipedia');
     
-    const companyName = apolloCompany?.name || domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+    const companyName = enrichloopsCompany?.name || domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
     
     company = {
       name: companyName,
-      website: apolloCompany?.website_url || `https://${domain}`,
-      industry: apolloCompany?.industry || duckduckgo?.Abstract || null,
-      employees: apolloCompany?.estimated_num_employees?.toLocaleString('en-US') || null,
-      revenue: apolloCompany?.annual_revenue_printed || null,
-      revenueValue: apolloCompany?.annual_revenue || null,
-      linkedin: apolloCompany?.linkedin_url || null,
-      location: apolloCompany
-        ? [apolloCompany.city, apolloCompany.state, apolloCompany.country].filter(Boolean).join(', ')
+      website: enrichloopsCompany?.domain ? `https://${enrichloopsCompany.domain}` : `https://${domain}`,
+      industry: enrichloopsCompany?.primary_industry || null,
+      employees: enrichloopsCompany?.employee_count?.toLocaleString('en-US') || null,
+      employeeRange: enrichloopsCompany?.employee_range || null,
+      linkedin: enrichloopsCompany?.linkedin_url || null,
+      location: enrichloopsCompany?.headquarters 
+        ? `${enrichloopsCompany.headquarters.city || ''}, ${enrichloopsCompany.headquarters.country || ''}`.replace(/^, |, $/g, '')
         : null,
       logo: `https://logo.clearbit.com/${domain}`,
-      description: wikipedia?.extract || duckduckgo?.Abstract || null,
+      description: wikipedia?.extract || null,
     };
     
     // Cache company
@@ -377,7 +432,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
       const data = await enrichLead(name.trim(), email.trim());
       setResult(data);
     } catch (err: any) {
-      setError('Could not retrieve data. Please try again.');
+      setError(err.message || 'Could not retrieve data. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -396,7 +451,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     if (result.company) {
       if (result.company.name) lines.push(`Company: ${result.company.name}`);
       if (result.company.employees) lines.push(`Employees: ${result.company.employees}`);
-      if (result.company.revenue) lines.push(`Revenue: ${result.company.revenue} (est.)`);
+      if (result.company.employeeRange) lines.push(`Employee Range: ${result.company.employeeRange}`);
     }
     const text = lines.join('\n');
     navigator.clipboard.writeText(text).then(() => {
@@ -475,7 +530,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                   {loading ? 'Looking up…' : 'Look up lead'}
                 </button>
                 <p className="mt-3 text-xs text-[--color-muted]">
-                  Uses multiple free data sources: Wikipedia, GitHub, Gravatar, Clearbit, and Apollo.
+                  Powered by Enrichloops + free APIs (Wikipedia, GitHub, Gravatar, Clearbit)
                 </p>
               </form>
             </div>
@@ -535,7 +590,9 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     Person
                   </h3>
                   <FieldRow label="Title" value={result.person?.title || null} />
-                  <FieldRow label="Seniority" value={result.person?.seniority || null} />
+                  {result.person?.headline && (
+                    <FieldRow label="Headline" value={result.person.headline} />
+                  )}
                   <FieldRow
                     label="LinkedIn"
                     value={result.person?.linkedin ? 'View profile' : null}
@@ -575,8 +632,13 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     value={result.company?.employees || null}
                   />
                   <FieldRow
-                    label="Revenue (est.)"
-                    value={result.company?.revenue || null}
+                    label="Size Range"
+                    value={result.company?.employeeRange || null}
+                  />
+                  <FieldRow
+                    label="LinkedIn"
+                    value={result.company?.linkedin ? 'View company' : null}
+                    link={result.company?.linkedin || undefined}
                   />
                   <FieldRow label="Location" value={result.company?.location || null} />
                   {result.company?.description && (
@@ -599,7 +661,8 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
             {loading && !result && (
               <div className="bg-white border border-[--color-border] rounded-lg p-8 text-center">
-                <p className="text-sm text-[--color-muted]">Looking up lead information from multiple sources…</p>
+                <p className="text-sm text-[--color-muted]">Looking up lead information…</p>
+                <p className="text-xs text-[--color-muted] mt-2">This may take a few seconds for Enrichloops to process</p>
               </div>
             )}
           </div>
