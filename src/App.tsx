@@ -4,9 +4,12 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 const APOLLO_API_KEY = 'UhKB7c0hM4t2Ep1ihvRBRg';
 const TEAM_PASSWORD = 'demo123';
 
-// CORS proxy to allow browser → Apollo API calls
-// Apollo blocks direct browser requests (CORS), so we route through a proxy
-const CORS_PROXY = 'https://corsproxy.io/?url=';
+// Multiple CORS proxies to try (some strip custom headers)
+const CORS_PROXIES = [
+  'https://corsproxy.io/?url=',
+  'https://api.allorigins.win/raw?url=',
+  'https://cors.eu.org/',
+];
 
 // ─── Personal/free email domains ─────────────────────────────────────────────
 const PERSONAL_DOMAINS = new Set([
@@ -70,106 +73,148 @@ interface EnrichResult {
   matched: MatchedFlags;
 }
 
-// ─── Apollo API helpers (via CORS proxy) ─────────────────────────────────────
-async function apolloFetch(url: string, options: RequestInit) {
+interface DebugInfo {
+  status: number | null;
+  statusText: string;
+  bodyPreview: string;
+  proxyUsed: string;
+}
+
+// ─── Apollo API helper with CORS proxy fallback ──────────────────────────────
+async function apolloFetchWithProxy(
+  url: string,
+  options: RequestInit,
+  setDebug: (info: DebugInfo) => void
+): Promise<Response> {
   // Try backend first (if server.js is running)
   try {
     const backendUrl = url.replace('https://api.apollo.io', '/api/apollo-proxy');
     const res = await fetch(backendUrl, {
       ...options,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(8000),
     });
-    if (res.ok || res.status === 404 || res.status === 429) {
+    if (res.ok || res.status === 404 || res.status === 429 || res.status === 401) {
+      setDebug({ status: res.status, statusText: 'Backend proxy', bodyPreview: '', proxyUsed: 'backend' });
       return res;
     }
   } catch {
-    // Backend not available, use CORS proxy
+    // Backend not available
   }
 
-  // Fallback: use CORS proxy
-  const proxyUrl = CORS_PROXY + encodeURIComponent(url);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  // Try each CORS proxy
+  for (let i = 0; i < CORS_PROXIES.length; i++) {
+    const proxy = CORS_PROXIES[i];
+    const proxyUrl = proxy + encodeURIComponent(url);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
 
-  try {
-    const res = await fetch(proxyUrl, {
-      ...options,
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    return res;
-  } catch (err: any) {
-    clearTimeout(timeout);
-    if (err.name === 'AbortError') {
-      throw new Error('TIMEOUT');
+    try {
+      const res = await fetch(proxyUrl, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      const text = await res.clone().text().catch(() => '');
+      setDebug({
+        status: res.status,
+        statusText: res.statusText,
+        bodyPreview: text.substring(0, 300),
+        proxyUsed: proxy,
+      });
+
+      return res;
+    } catch (err: any) {
+      clearTimeout(timeout);
+      if (i === CORS_PROXIES.length - 1) {
+        // Last proxy failed
+        if (err.name === 'AbortError') {
+          throw new Error('TIMEOUT');
+        }
+        throw new Error('ALL_PROXIES_FAILED');
+      }
+      // Try next proxy
+      continue;
     }
-    throw new Error('NETWORK_ERROR');
   }
+
+  throw new Error('ALL_PROXIES_FAILED');
 }
 
-async function lookupPerson(name: string, email: string) {
+async function lookupPerson(name: string, email: string, setDebug: (info: DebugInfo) => void) {
   const url = 'https://api.apollo.io/api/v1/people/match';
 
   try {
-    const response = await apolloFetch(url, {
+    const response = await apolloFetchWithProxy(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
         'x-api-key': APOLLO_API_KEY,
+        'Accept': 'application/json',
       },
       body: JSON.stringify({ name, email }),
-    });
+    }, setDebug);
 
     if (response.status === 429) {
       throw new Error('RATE_LIMIT');
     }
 
+    if (response.status === 401) {
+      throw new Error('INVALID_API_KEY');
+    }
+
     if (!response.ok) {
       if (response.status === 404) return null;
-      const text = await response.text().catch(() => '');
-      console.error('Apollo person error:', response.status, text);
       throw new Error('APOLLO_ERROR');
     }
 
     const data = await response.json();
+    
+    // Check match_confidence
+    if (data.person && data.person.match_confidence === 'none') {
+      return null; // No match found
+    }
+    
     return data.person || null;
   } catch (err: any) {
-    if (err.message === 'RATE_LIMIT') throw err;
-    if (err.message === 'TIMEOUT' || err.message === 'NETWORK_ERROR') throw err;
+    if (err.message === 'RATE_LIMIT' || err.message === 'INVALID_API_KEY') throw err;
+    if (err.message === 'TIMEOUT' || err.message === 'ALL_PROXIES_FAILED') throw err;
     return null;
   }
 }
 
-async function lookupCompany(domain: string) {
+async function lookupCompany(domain: string, setDebug: (info: DebugInfo) => void) {
   const url = `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`;
 
   try {
-    const response = await apolloFetch(url, {
+    const response = await apolloFetchWithProxy(url, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
         'x-api-key': APOLLO_API_KEY,
+        'Accept': 'application/json',
       },
-    });
+    }, setDebug);
 
     if (response.status === 429) {
       throw new Error('RATE_LIMIT');
     }
 
+    if (response.status === 401) {
+      throw new Error('INVALID_API_KEY');
+    }
+
     if (!response.ok) {
       if (response.status === 404) return null;
-      const text = await response.text().catch(() => '');
-      console.error('Apollo company error:', response.status, text);
       return null; // failure-tolerant
     }
 
     const data = await response.json();
     return data.organization || null;
   } catch (err: any) {
-    if (err.message === 'RATE_LIMIT') throw err;
-    if (err.message === 'TIMEOUT' || err.message === 'NETWORK_ERROR') throw err;
+    if (err.message === 'RATE_LIMIT' || err.message === 'INVALID_API_KEY') throw err;
     return null; // failure-tolerant
   }
 }
@@ -204,7 +249,6 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
       const data = await res.json();
       setError(data.error || 'Invalid password');
     } catch {
-      // No backend — check password client-side
       if (password === TEAM_PASSWORD) {
         onLogin();
       } else {
@@ -291,17 +335,16 @@ function AppView({ onLogout }: { onLogout: () => void }) {
   const [result, setResult] = useState<EnrichResult | null>(null);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
-  const [debugInfo, setDebugInfo] = useState('');
+  const [debug, setDebug] = useState<DebugInfo | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleLookup = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setDebugInfo('');
+    setDebug(null);
     setLoading(true);
     setResult(null);
 
-    // Validate input
     if (!name.trim()) {
       setError('Name is required');
       setLoading(false);
@@ -317,7 +360,6 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
     const domain = email.split('@')[1].toLowerCase();
 
-    // Check personal domain
     if (PERSONAL_DOMAINS.has(domain)) {
       setError('Personal email addresses (Gmail, Yahoo, etc.) are not supported. Please provide a work email address.');
       setLoading(false);
@@ -325,25 +367,18 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     }
 
     try {
-      setDebugInfo('Connecting to Apollo API…');
-
-      // Check cache
       const cachedCompany = getCachedCompany(domain);
 
-      // Parallel lookups
-      const personPromise = lookupPerson(name.trim(), email.trim());
+      const personPromise = lookupPerson(name.trim(), email.trim(), setDebug);
       const companyPromise = cachedCompany !== undefined
         ? Promise.resolve(cachedCompany)
-        : lookupCompany(domain);
-
-      setDebugInfo('Fetching person and company data…');
+        : lookupCompany(domain, setDebug);
 
       const [personResult, companyResult] = await Promise.all([
         personPromise,
         companyPromise,
       ]);
 
-      // Cache company result
       if (cachedCompany === undefined && companyResult !== null) {
         setCachedCompany(domain, companyResult);
       }
@@ -351,14 +386,10 @@ function AppView({ onLogout }: { onLogout: () => void }) {
       let person = personResult;
       let company = companyResult;
 
-      // Fallback: use person.organization if company lookup returned nothing
       if (!company && person && person.organization) {
         company = person.organization;
       }
 
-      setDebugInfo('');
-
-      // Build response
       const response: EnrichResult = {
         input: { name: name.trim(), email: email.trim(), domain },
         person: person ? {
@@ -388,13 +419,14 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
       setResult(response);
     } catch (err: any) {
-      setDebugInfo('');
       if (err.message === 'RATE_LIMIT') {
         setError('Rate limit reached on Apollo API. Please wait a moment and try again.');
+      } else if (err.message === 'INVALID_API_KEY') {
+        setError('Invalid Apollo API key. Please check your API key configuration.');
       } else if (err.message === 'TIMEOUT') {
         setError('Request timed out. The enrichment service may be slow. Please try again.');
-      } else if (err.message === 'NETWORK_ERROR') {
-        setError('Network error — could not reach the enrichment service. Please check your connection and try again.');
+      } else if (err.message === 'ALL_PROXIES_FAILED') {
+        setError('Could not connect to Apollo API through any proxy. Please run the backend server locally with: node server.js');
       } else {
         setError('Could not retrieve data. Please try again.');
       }
@@ -515,9 +547,17 @@ function AppView({ onLogout }: { onLogout: () => void }) {
               </div>
             )}
 
-            {debugInfo && (
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
-                <p className="text-sm text-blue-700">{debugInfo}</p>
+            {debug && (
+              <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 mb-4 text-xs font-mono">
+                <p className="font-semibold mb-1">Debug Info:</p>
+                <p>Status: {debug.status} {debug.statusText}</p>
+                <p>Proxy: {debug.proxyUsed}</p>
+                {debug.bodyPreview && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer text-[--color-teal]">Response preview</summary>
+                    <pre className="mt-1 whitespace-pre-wrap break-words text-gray-700">{debug.bodyPreview}</pre>
+                  </details>
+                )}
               </div>
             )}
 
