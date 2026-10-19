@@ -86,19 +86,38 @@ async function apolloFetchWithProxy(
   options: RequestInit,
   setDebug: (info: DebugInfo) => void
 ): Promise<Response> {
-  // Try backend first (if server.js is running)
+  // Try Netlify Function first (if deployed on Netlify)
+  try {
+    const apolloPath = url.replace('https://api.apollo.io/', '');
+    const backendUrl = `/.netlify/functions/apollo-proxy?path=${encodeURIComponent(apolloPath)}`;
+    const res = await fetch(backendUrl, {
+      ...options,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok || res.status === 429 || res.status === 401) {
+      const text = await res.clone().text().catch(() => '');
+      setDebug({ status: res.status, statusText: 'Netlify Function', bodyPreview: text.substring(0, 300), proxyUsed: 'netlify-function' });
+      return res;
+    }
+    // 404 means function not deployed, fall through to CORS proxies
+  } catch {
+    // Netlify Function not available
+  }
+  
+  // Try local backend (if running node server.js)
   try {
     const backendUrl = url.replace('https://api.apollo.io', '/api/apollo-proxy');
     const res = await fetch(backendUrl, {
       ...options,
       signal: AbortSignal.timeout(8000),
     });
-    if (res.ok || res.status === 404 || res.status === 429 || res.status === 401) {
-      setDebug({ status: res.status, statusText: 'Backend proxy', bodyPreview: '', proxyUsed: 'backend' });
+    if (res.ok || res.status === 429 || res.status === 401) {
+      const text = await res.clone().text().catch(() => '');
+      setDebug({ status: res.status, statusText: 'Local backend', bodyPreview: text.substring(0, 300), proxyUsed: 'local-backend' });
       return res;
     }
   } catch {
-    // Backend not available
+    // Local backend not available
   }
 
   // Try each CORS proxy
@@ -246,9 +265,19 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
         onLogin();
         return;
       }
-      const data = await res.json();
-      setError(data.error || 'Invalid password');
+      if (res.status === 401) {
+        const data = await res.json();
+        setError(data.error || 'Invalid password');
+        return;
+      }
+      // If backend not available, fall back to client-side check
+      if (password === TEAM_PASSWORD) {
+        onLogin();
+      } else {
+        setError('Invalid password');
+      }
     } catch {
+      // Backend not available, use client-side check
       if (password === TEAM_PASSWORD) {
         onLogin();
       } else {
@@ -648,7 +677,11 @@ export default function App() {
 
   useEffect(() => {
     fetch('/api/session', { signal: AbortSignal.timeout(3000) })
-      .then(res => res.json())
+      .then(res => {
+        if (res.ok) return res.json();
+        // If Netlify function not deployed, treat as not authenticated
+        return { authed: false };
+      })
       .then(data => setAuthed(data.authed === true))
       .catch(() => setAuthed(false));
   }, []);

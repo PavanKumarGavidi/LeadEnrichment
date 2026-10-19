@@ -59,6 +59,23 @@ fly secrets set SECURE_COOKIES=true
 fly deploy
 ```
 
+### Netlify
+
+1. Push your code to GitHub
+2. In Netlify dashboard, click "Add new site" → "Import an existing project"
+3. Connect your GitHub repo
+4. Netlify will auto-detect the settings from `netlify.toml`:
+   - Build command: `npm run build`
+   - Publish directory: `dist`
+   - Functions directory: `netlify/functions`
+5. Go to **Site settings → Environment variables** and add:
+   - `APOLLO_API_KEY` = your Apollo API key
+   - `TEAM_PASSWORD` = your team password
+   - `SESSION_SECRET` = any random string
+6. Click "Deploy site"
+
+Netlify Functions will handle the API proxy and authentication automatically. No Node.js server needed!
+
 ## Safeguards
 
 - **Authentication**: All API endpoints require a valid session. Login is rate-limited to 10 attempts per 15 minutes.
