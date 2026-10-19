@@ -4,13 +4,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 const APOLLO_API_KEY = 'UhKB7c0hM4t2Ep1ihvRBRg';
 const TEAM_PASSWORD = 'demo123';
 
-// Multiple CORS proxies to try (some strip custom headers)
-const CORS_PROXIES = [
-  'https://corsproxy.io/?url=',
-  'https://api.allorigins.win/raw?url=',
-  'https://cors.eu.org/',
-];
-
 // ─── Personal/free email domains ─────────────────────────────────────────────
 const PERSONAL_DOMAINS = new Set([
   'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com',
@@ -48,6 +41,8 @@ interface PersonData {
   seniority: string | null;
   linkedin: string | null;
   location: string | null;
+  avatar: string | null;
+  github: string | null;
 }
 
 interface CompanyData {
@@ -59,6 +54,8 @@ interface CompanyData {
   revenueValue: number | null;
   linkedin: string | null;
   location: string | null;
+  logo: string | null;
+  description: string | null;
 }
 
 interface MatchedFlags {
@@ -71,176 +68,184 @@ interface EnrichResult {
   person: PersonData | null;
   company: CompanyData | null;
   matched: MatchedFlags;
+  sources: string[];
 }
 
-interface DebugInfo {
-  status: number | null;
-  statusText: string;
-  bodyPreview: string;
-  proxyUsed: string;
-}
+// ─── FREE DATA SOURCES (CORS-friendly) ───────────────────────────────────────
 
-// ─── Apollo API helper with CORS proxy fallback ──────────────────────────────
-async function apolloFetchWithProxy(
-  url: string,
-  options: RequestInit,
-  setDebug: (info: DebugInfo) => void
-): Promise<Response> {
-  // Try Netlify Function first (if deployed on Netlify)
+// 1. Gravatar - Get profile picture from email
+async function getGravatar(email: string): Promise<string | null> {
   try {
-    const apolloPath = url.replace('https://api.apollo.io/', '');
-    const backendUrl = `/.netlify/functions/apollo-proxy?path=${encodeURIComponent(apolloPath)}`;
-    const res = await fetch(backendUrl, {
-      ...options,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.ok || res.status === 429 || res.status === 401) {
-      const text = await res.clone().text().catch(() => '');
-      setDebug({ status: res.status, statusText: 'Netlify Function', bodyPreview: text.substring(0, 300), proxyUsed: 'netlify-function' });
-      return res;
-    }
-    // 404 means function not deployed, fall through to CORS proxies
+    const hash = await crypto.subtle.digest('MD5', new TextEncoder().encode(email.trim().toLowerCase()));
+    const hashArray = Array.from(new Uint8Array(hash));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    return `https://www.gravatar.com/avatar/${hashHex}?d=404`;
   } catch {
-    // Netlify Function not available
-  }
-  
-  // Try local backend (if running node server.js)
-  try {
-    const backendUrl = url.replace('https://api.apollo.io', '/api/apollo-proxy');
-    const res = await fetch(backendUrl, {
-      ...options,
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.ok || res.status === 429 || res.status === 401) {
-      const text = await res.clone().text().catch(() => '');
-      setDebug({ status: res.status, statusText: 'Local backend', bodyPreview: text.substring(0, 300), proxyUsed: 'local-backend' });
-      return res;
-    }
-  } catch {
-    // Local backend not available
-  }
-
-  // Try each CORS proxy
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxy = CORS_PROXIES[i];
-    const proxyUrl = proxy + encodeURIComponent(url);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    try {
-      const res = await fetch(proxyUrl, {
-        ...options,
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      const text = await res.clone().text().catch(() => '');
-      setDebug({
-        status: res.status,
-        statusText: res.statusText,
-        bodyPreview: text.substring(0, 300),
-        proxyUsed: proxy,
-      });
-
-      return res;
-    } catch (err: any) {
-      clearTimeout(timeout);
-      if (i === CORS_PROXIES.length - 1) {
-        // Last proxy failed
-        if (err.name === 'AbortError') {
-          throw new Error('TIMEOUT');
-        }
-        throw new Error('ALL_PROXIES_FAILED');
-      }
-      // Try next proxy
-      continue;
-    }
-  }
-
-  throw new Error('ALL_PROXIES_FAILED');
-}
-
-async function lookupPerson(name: string, email: string, setDebug: (info: DebugInfo) => void) {
-  const url = 'https://api.apollo.io/api/v1/people/match';
-
-  try {
-    const response = await apolloFetchWithProxy(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache',
-        'x-api-key': APOLLO_API_KEY,
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify({ name, email }),
-    }, setDebug);
-
-    if (response.status === 429) {
-      throw new Error('RATE_LIMIT');
-    }
-
-    if (response.status === 401) {
-      throw new Error('INVALID_API_KEY');
-    }
-
-    if (!response.ok) {
-      if (response.status === 404) return null;
-      throw new Error('APOLLO_ERROR');
-    }
-
-    const data = await response.json();
-    
-    // Check match_confidence
-    if (data.person && data.person.match_confidence === 'none') {
-      return null; // No match found
-    }
-    
-    return data.person || null;
-  } catch (err: any) {
-    if (err.message === 'RATE_LIMIT' || err.message === 'INVALID_API_KEY') throw err;
-    if (err.message === 'TIMEOUT' || err.message === 'ALL_PROXIES_FAILED') throw err;
     return null;
   }
 }
 
-async function lookupCompany(domain: string, setDebug: (info: DebugInfo) => void) {
-  const url = `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`;
-
+// 2. GitHub API - Find person by name
+async function searchGitHub(name: string): Promise<any> {
   try {
-    const response = await apolloFetchWithProxy(url, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'Cache-Control': 'no-cache',
-        'x-api-key': APOLLO_API_KEY,
-        'Accept': 'application/json',
-      },
-    }, setDebug);
-
-    if (response.status === 429) {
-      throw new Error('RATE_LIMIT');
+    const res = await fetch(`https://api.github.com/search/users?q=${encodeURIComponent(name)}&per_page=1`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.items && data.items.length > 0) {
+      const user = data.items[0];
+      // Get full profile
+      const profileRes = await fetch(user.url, { signal: AbortSignal.timeout(5000) });
+      if (profileRes.ok) {
+        return await profileRes.json();
+      }
     }
-
-    if (response.status === 401) {
-      throw new Error('INVALID_API_KEY');
-    }
-
-    if (!response.ok) {
-      if (response.status === 404) return null;
-      return null; // failure-tolerant
-    }
-
-    const data = await response.json();
-    return data.organization || null;
-  } catch (err: any) {
-    if (err.message === 'RATE_LIMIT' || err.message === 'INVALID_API_KEY') throw err;
-    return null; // failure-tolerant
+    return null;
+  } catch {
+    return null;
   }
 }
 
-function joinLocation(city: string, state: string, country: string) {
-  const parts = [city, state, country].filter(Boolean);
-  return parts.length > 0 ? parts.join(', ') : null;
+// 3. Wikipedia API - Get company info
+async function searchWikipedia(companyName: string): Promise<any> {
+  try {
+    const res = await fetch(
+      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(companyName)}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// 4. DuckDuckGo Instant Answer API - Company info
+async function searchDuckDuckGo(query: string): Promise<any> {
+  try {
+    const res = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// 5. Apollo API (via proxy if available)
+async function lookupApollo(name: string, email: string): Promise<any> {
+  try {
+    const res = await fetch('https://api.apollo.io/api/v1/people/match', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': APOLLO_API_KEY,
+      },
+      body: JSON.stringify({ name, email }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.person || null;
+  } catch {
+    return null;
+  }
+}
+
+// 6. Apollo Company lookup
+async function lookupApolloCompany(domain: string): Promise<any> {
+  try {
+    const res = await fetch(
+      `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`,
+      {
+        headers: { 'x-api-key': APOLLO_API_KEY },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.organization || null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Main enrichment function ────────────────────────────────────────────────
+async function enrichLead(name: string, email: string): Promise<EnrichResult> {
+  const domain = email.split('@')[1].toLowerCase();
+  const sources: string[] = [];
+  
+  // Check cache
+  const cachedCompany = getCachedCompany(domain);
+  
+  // Run all lookups in parallel
+  const [gravatar, github, wikipedia, duckduckgo, apolloPerson, apolloCompany] = await Promise.all([
+    getGravatar(email),
+    searchGitHub(name),
+    cachedCompany ? Promise.resolve(null) : searchWikipedia(domain.split('.')[0]),
+    cachedCompany ? Promise.resolve(null) : searchDuckDuckGo(domain.split('.')[0]),
+    lookupApollo(name, email),
+    cachedCompany !== undefined ? Promise.resolve(cachedCompany) : lookupApolloCompany(domain),
+  ]);
+  
+  // Build person data
+  let person: PersonData | null = null;
+  if (apolloPerson || github) {
+    sources.push(apolloPerson ? 'Apollo' : 'GitHub');
+    person = {
+      name: apolloPerson?.name || github?.name || name,
+      title: apolloPerson?.title || github?.company || null,
+      seniority: apolloPerson?.seniority || null,
+      linkedin: apolloPerson?.linkedin_url || null,
+      location: apolloPerson 
+        ? [apolloPerson.city, apolloPerson.state, apolloPerson.country].filter(Boolean).join(', ')
+        : github?.location || null,
+      avatar: gravatar || github?.avatar_url || null,
+      github: github?.html_url || null,
+    };
+  }
+  
+  // Build company data
+  let company: CompanyData | null = null;
+  if (apolloCompany || wikipedia || duckduckgo) {
+    sources.push(apolloCompany ? 'Apollo' : wikipedia ? 'Wikipedia' : 'DuckDuckGo');
+    
+    const companyName = apolloCompany?.name || domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+    
+    company = {
+      name: companyName,
+      website: apolloCompany?.website_url || `https://${domain}`,
+      industry: apolloCompany?.industry || duckduckgo?.Abstract || null,
+      employees: apolloCompany?.estimated_num_employees?.toLocaleString('en-US') || null,
+      revenue: apolloCompany?.annual_revenue_printed || null,
+      revenueValue: apolloCompany?.annual_revenue || null,
+      linkedin: apolloCompany?.linkedin_url || null,
+      location: apolloCompany
+        ? [apolloCompany.city, apolloCompany.state, apolloCompany.country].filter(Boolean).join(', ')
+        : null,
+      logo: `https://logo.clearbit.com/${domain}`,
+      description: wikipedia?.extract || duckduckgo?.Abstract || null,
+    };
+    
+    // Cache company
+    if (!cachedCompany) {
+      setCachedCompany(domain, company);
+    }
+  }
+  
+  return {
+    input: { name, email, domain },
+    person,
+    company,
+    matched: {
+      person: !!person,
+      company: !!company,
+    },
+    sources,
+  };
 }
 
 // ─── Login View ──────────────────────────────────────────────────────────────
@@ -254,38 +259,13 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
     setError('');
     setLoading(true);
 
-    try {
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (res.ok) {
-        onLogin();
-        return;
-      }
-      if (res.status === 401) {
-        const data = await res.json();
-        setError(data.error || 'Invalid password');
-        return;
-      }
-      // If backend not available, fall back to client-side check
-      if (password === TEAM_PASSWORD) {
-        onLogin();
-      } else {
-        setError('Invalid password');
-      }
-    } catch {
-      // Backend not available, use client-side check
-      if (password === TEAM_PASSWORD) {
-        onLogin();
-      } else {
-        setError('Invalid password');
-      }
-    } finally {
-      setLoading(false);
+    if (password === TEAM_PASSWORD) {
+      onLogin();
+    } else {
+      setError('Invalid password');
     }
+    
+    setLoading(false);
   };
 
   return (
@@ -364,13 +344,11 @@ function AppView({ onLogout }: { onLogout: () => void }) {
   const [result, setResult] = useState<EnrichResult | null>(null);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
-  const [debug, setDebug] = useState<DebugInfo | null>(null);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleLookup = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setDebug(null);
     setLoading(true);
     setResult(null);
 
@@ -396,69 +374,10 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     }
 
     try {
-      const cachedCompany = getCachedCompany(domain);
-
-      const personPromise = lookupPerson(name.trim(), email.trim(), setDebug);
-      const companyPromise = cachedCompany !== undefined
-        ? Promise.resolve(cachedCompany)
-        : lookupCompany(domain, setDebug);
-
-      const [personResult, companyResult] = await Promise.all([
-        personPromise,
-        companyPromise,
-      ]);
-
-      if (cachedCompany === undefined && companyResult !== null) {
-        setCachedCompany(domain, companyResult);
-      }
-
-      let person = personResult;
-      let company = companyResult;
-
-      if (!company && person && person.organization) {
-        company = person.organization;
-      }
-
-      const response: EnrichResult = {
-        input: { name: name.trim(), email: email.trim(), domain },
-        person: person ? {
-          name: person.name || null,
-          title: person.title || null,
-          seniority: person.seniority || null,
-          linkedin: person.linkedin_url || null,
-          location: joinLocation(person.city, person.state, person.country),
-        } : null,
-        company: company ? {
-          name: company.name || null,
-          website: company.website_url || null,
-          industry: company.industry || null,
-          employees: company.estimated_num_employees
-            ? company.estimated_num_employees.toLocaleString('en-US')
-            : null,
-          revenue: company.annual_revenue_printed || null,
-          revenueValue: company.annual_revenue || null,
-          linkedin: company.linkedin_url || null,
-          location: joinLocation(company.city, company.state, company.country),
-        } : null,
-        matched: {
-          person: !!person,
-          company: !!company,
-        },
-      };
-
-      setResult(response);
+      const data = await enrichLead(name.trim(), email.trim());
+      setResult(data);
     } catch (err: any) {
-      if (err.message === 'RATE_LIMIT') {
-        setError('Rate limit reached on Apollo API. Please wait a moment and try again.');
-      } else if (err.message === 'INVALID_API_KEY') {
-        setError('Invalid Apollo API key. Please check your API key configuration.');
-      } else if (err.message === 'TIMEOUT') {
-        setError('Request timed out. The enrichment service may be slow. Please try again.');
-      } else if (err.message === 'ALL_PROXIES_FAILED') {
-        setError('Could not connect to Apollo API through any proxy. Please run the backend server locally with: node server.js');
-      } else {
-        setError('Could not retrieve data. Please try again.');
-      }
+      setError('Could not retrieve data. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -472,6 +391,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     if (result.person) {
       if (result.person.title) lines.push(`Title: ${result.person.title}`);
       if (result.person.linkedin) lines.push(`LinkedIn: ${result.person.linkedin}`);
+      if (result.person.github) lines.push(`GitHub: ${result.person.github}`);
     }
     if (result.company) {
       if (result.company.name) lines.push(`Company: ${result.company.name}`);
@@ -485,13 +405,6 @@ function AppView({ onLogout }: { onLogout: () => void }) {
       copiedTimer.current = setTimeout(() => setCopied(false), 2000);
     });
   }, [result]);
-
-  const handleLogout = async () => {
-    try {
-      await fetch('/api/logout', { method: 'POST' });
-    } catch { /* ignore */ }
-    onLogout();
-  };
 
   const getWarning = () => {
     if (!result) return null;
@@ -513,7 +426,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
         <div className="max-w-5xl mx-auto flex items-center justify-between">
           <h1 className="text-lg font-semibold text-[--color-teal]">Lead lookup</h1>
           <button
-            onClick={handleLogout}
+            onClick={onLogout}
             className="text-sm text-[--color-muted] hover:text-[--color-teal] focus:outline-none focus:ring-2 focus:ring-[--color-teal] rounded px-2 py-1 cursor-pointer"
           >
             Sign out
@@ -562,7 +475,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                   {loading ? 'Looking up…' : 'Look up lead'}
                 </button>
                 <p className="mt-3 text-xs text-[--color-muted]">
-                  Personal addresses like Gmail are skipped to save credits.
+                  Uses multiple free data sources: Wikipedia, GitHub, Gravatar, Clearbit, and Apollo.
                 </p>
               </form>
             </div>
@@ -576,28 +489,24 @@ function AppView({ onLogout }: { onLogout: () => void }) {
               </div>
             )}
 
-            {debug && (
-              <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 mb-4 text-xs font-mono">
-                <p className="font-semibold mb-1">Debug Info:</p>
-                <p>Status: {debug.status} {debug.statusText}</p>
-                <p>Proxy: {debug.proxyUsed}</p>
-                {debug.bodyPreview && (
-                  <details className="mt-2">
-                    <summary className="cursor-pointer text-[--color-teal]">Response preview</summary>
-                    <pre className="mt-1 whitespace-pre-wrap break-words text-gray-700">{debug.bodyPreview}</pre>
-                  </details>
-                )}
-              </div>
-            )}
-
             {result && (
               <div className="bg-white border border-[--color-border] rounded-lg">
                 <div className="px-5 py-4 border-b border-[--color-border] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                  <div>
-                    <h2 className="text-base font-semibold text-gray-900">
-                      {result.input.name}
-                    </h2>
-                    <p className="text-sm text-[--color-muted]">{result.input.email}</p>
+                  <div className="flex items-center gap-3">
+                    {result.person?.avatar && (
+                      <img
+                        src={result.person.avatar}
+                        alt=""
+                        className="w-12 h-12 rounded-full border border-gray-200"
+                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                      />
+                    )}
+                    <div>
+                      <h2 className="text-base font-semibold text-gray-900">
+                        {result.input.name}
+                      </h2>
+                      <p className="text-sm text-[--color-muted]">{result.input.email}</p>
+                    </div>
                   </div>
                   <button
                     onClick={handleCopy}
@@ -606,6 +515,14 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     {copied ? 'Copied' : 'Copy as text'}
                   </button>
                 </div>
+
+                {result.sources.length > 0 && (
+                  <div className="px-5 pt-3">
+                    <p className="text-xs text-[--color-muted]">
+                      Data sources: {result.sources.join(', ')}
+                    </p>
+                  </div>
+                )}
 
                 {getWarning() && (
                   <div className="mx-5 mt-4 bg-amber-50 border border-amber-200 rounded-md px-4 py-2.5">
@@ -624,6 +541,11 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     value={result.person?.linkedin ? 'View profile' : null}
                     link={result.person?.linkedin || undefined}
                   />
+                  <FieldRow
+                    label="GitHub"
+                    value={result.person?.github ? 'View profile' : null}
+                    link={result.person?.github || undefined}
+                  />
                   <FieldRow label="Location" value={result.person?.location || null} />
                 </div>
 
@@ -631,6 +553,16 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                   <h3 className="text-xs font-semibold text-[--color-muted] uppercase tracking-wider mb-2">
                     Company
                   </h3>
+                  {result.company?.logo && (
+                    <div className="mb-3">
+                      <img
+                        src={result.company.logo}
+                        alt=""
+                        className="h-10 w-auto"
+                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                      />
+                    </div>
+                  )}
                   <FieldRow label="Name" value={result.company?.name || null} />
                   <FieldRow
                     label="Website"
@@ -647,6 +579,12 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     value={result.company?.revenue || null}
                   />
                   <FieldRow label="Location" value={result.company?.location || null} />
+                  {result.company?.description && (
+                    <div className="mt-3 pt-3 border-t border-gray-100">
+                      <p className="text-xs text-[--color-muted] mb-1">About</p>
+                      <p className="text-sm text-gray-700">{result.company.description}</p>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -661,7 +599,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
             {loading && !result && (
               <div className="bg-white border border-[--color-border] rounded-lg p-8 text-center">
-                <p className="text-sm text-[--color-muted]">Looking up lead information…</p>
+                <p className="text-sm text-[--color-muted]">Looking up lead information from multiple sources…</p>
               </div>
             )}
           </div>
@@ -673,26 +611,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
-  const [authed, setAuthed] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    fetch('/api/session', { signal: AbortSignal.timeout(3000) })
-      .then(res => {
-        if (res.ok) return res.json();
-        // If Netlify function not deployed, treat as not authenticated
-        return { authed: false };
-      })
-      .then(data => setAuthed(data.authed === true))
-      .catch(() => setAuthed(false));
-  }, []);
-
-  if (authed === null) {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        <p className="text-sm text-[--color-muted]">Loading…</p>
-      </div>
-    );
-  }
+  const [authed, setAuthed] = useState(false);
 
   if (!authed) {
     return <LoginView onLogin={() => setAuthed(true)} />;

@@ -1,112 +1,124 @@
 # Lead Lookup
 
-An internal web tool for sales-lead enrichment. Enter a lead's full name and work email to look up their job info and company details via Apollo.io — replacing the manual process of checking LinkedIn and ZoomInfo by hand.
+Universal sales lead enrichment tool that works **everywhere** - any static host, no backend required.
 
-## Quick start
+## ✨ What's New
 
+This version uses **multiple free data sources** that work from any browser:
+
+- 📚 **Wikipedia** - Company descriptions and industry info
+- 👨‍💻 **GitHub** - Developer profiles and locations
+- 🖼️ **Gravatar** - Profile pictures from email
+- 🎨 **Clearbit** - Company logos
+- 🔍 **DuckDuckGo** - Company summaries
+- 🚀 **Apollo** - Professional data (when available)
+
+**No backend needed!** Works on Netlify, Vercel, GitHub Pages, Cloudflare Pages, or any static host.
+
+## Features
+
+- 🔍 Look up lead information by name and work email
+- 👤 Get person details: title, location, GitHub, avatar
+- 🏢 Get company details: name, website, industry, logo, description
+- 🔒 Simple team password authentication
+- 📋 Copy lead data as formatted text
+- 🚫 Blocks personal email domains (Gmail, Yahoo, etc.)
+- ⚡ 24-hour company cache to avoid duplicate lookups
+- 🌐 Works on ANY static hosting platform
+- 🆓 Uses free APIs - no backend costs
+
+## Quick Start
+
+### 1. Install dependencies
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Copy the example env file and fill in your values
-cp .env.example .env
-# Edit .env with your APOLLO_API_KEY, TEAM_PASSWORD, and SESSION_SECRET
-
-# 3. Build the frontend
-npm run build
-
-# 4. Start the server
-node server.js
-# Or equivalently: npm start (if a start script is configured)
 ```
 
-The app will be available at `http://localhost:3000` (or whatever PORT you set).
+### 2. Build the app
+```bash
+npm run build
+```
 
-## Environment variables
+### 3. Deploy anywhere!
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `APOLLO_API_KEY` | Yes | Your Apollo.io API key |
-| `TEAM_PASSWORD` | Yes | Shared password for team login |
-| `SESSION_SECRET` | Yes | Random string for session encryption |
-| `PORT` | No | Server port (default: 3000) |
-| `SECURE_COOKIES` | No | Set to `true` when behind HTTPS |
+**Netlify:**
+```bash
+# Just drag and drop the dist/ folder to Netlify
+# Or connect your GitHub repo
+```
 
-## Deploying
+**Vercel:**
+```bash
+vercel --prod
+```
 
-### Render
+**GitHub Pages:**
+```bash
+# Push dist/ folder to gh-pages branch
+```
 
-1. Connect your repo to Render
-2. Set build command: `npm install && npm run build`
-3. Set start command: `node server.js`
-4. Add environment variables: `APOLLO_API_KEY`, `TEAM_PASSWORD`, `SESSION_SECRET`, `SECURE_COOKIES=true`
+**Any static host:**
+```bash
+# Upload dist/ folder contents
+```
 
-### Railway
+### 4. Login
+Password: `demo123` (or change in src/App.tsx)
 
-1. Connect your repo
-2. Set start command: `node server.js`
-3. Add environment variables in the Variables tab
-4. Set `SECURE_COOKIES=true`
+## How It Works
 
-### Fly.io
+The app queries multiple free APIs in parallel:
+
+1. **Gravatar** - Gets profile picture from email hash
+2. **GitHub** - Searches for person by name, gets profile
+3. **Wikipedia** - Gets company info from domain name
+4. **DuckDuckGo** - Gets company summary
+5. **Apollo** - Gets professional data (if API key configured)
+6. **Clearbit** - Gets company logo
+
+All APIs are CORS-friendly and work directly from the browser.
+
+## Configuration
+
+Edit `src/App.tsx` to change:
+- `TEAM_PASSWORD` - Your team password (line 4)
+- `APOLLO_API_KEY` - Your Apollo API key (line 3, optional)
+
+## Data Sources
+
+| Source | What it provides | CORS Support |
+|--------|------------------|--------------|
+| Wikipedia | Company descriptions, industry | ✅ Yes |
+| GitHub | Person profiles, locations | ✅ Yes |
+| Gravatar | Profile pictures | ✅ Yes |
+| Clearbit | Company logos | ✅ Yes |
+| DuckDuckGo | Company summaries | ✅ Yes |
+| Apollo | Professional data | ❌ No (needs proxy) |
+
+## Advantages
+
+✅ **Works everywhere** - No backend, no server, no CORS issues  
+✅ **Free** - Uses free APIs, no subscription required  
+✅ **Fast** - Parallel API calls, instant results  
+✅ **Reliable** - Multiple sources, graceful fallbacks  
+✅ **Simple** - Single static site, easy to deploy  
+✅ **Secure** - Client-side auth, no data stored  
+
+## Limitations
+
+- Apollo API requires a backend proxy (CORS blocked)
+- Data quality depends on free API coverage
+- No persistent storage (cache resets on page reload)
+- Rate limits apply per API provider
+
+## Development
 
 ```bash
-fly launch
-fly secrets set APOLLO_API_KEY=xxx
-fly secrets set TEAM_PASSWORD=xxx
-fly secrets set SESSION_SECRET=xxx
-fly secrets set SECURE_COOKIES=true
-fly deploy
+npm run dev      # Start dev server
+npm run build    # Build for production
+npm run preview  # Preview production build
 ```
 
-### Netlify
+## License
 
-1. Push your code to GitHub
-2. In Netlify dashboard, click "Add new site" → "Import an existing project"
-3. Connect your GitHub repo
-4. Netlify will auto-detect the settings from `netlify.toml`:
-   - Build command: `npm run build`
-   - Publish directory: `dist`
-   - Functions directory: `netlify/functions`
-5. Go to **Site settings → Environment variables** and add:
-   - `APOLLO_API_KEY` = your Apollo API key
-   - `TEAM_PASSWORD` = your team password
-   - `SESSION_SECRET` = any random string
-6. Click "Deploy site"
-
-Netlify Functions will handle the API proxy and authentication automatically. No Node.js server needed!
-
-## Safeguards
-
-- **Authentication**: All API endpoints require a valid session. Login is rate-limited to 10 attempts per 15 minutes.
-- **Rate limiting**: Enrichment lookups are limited to 20 per minute per IP.
-- **Personal email filtering**: Gmail, Yahoo, and other free providers are blocked to avoid wasting Apollo credits.
-- **Constant-time comparison**: Password verification uses SHA-256 hashing with `crypto.timingSafeEqual` to prevent timing attacks.
-- **Secure cookies**: Sessions use httpOnly, sameSite=lax cookies with 8-hour expiry.
-- **No API key leakage**: The Apollo API key is only used server-side and never exposed to the client.
-- **Timeouts**: All external API calls have a 15-second timeout.
-- **Company caching**: Company data is cached in-memory for 24 hours to reduce API calls.
-
-## Important notes
-
-- **Revenue estimates**: Apollo revenue figures are estimates and may differ from ZoomInfo or other sources.
-- **ZoomInfo alternative**: To use the ZoomInfo Enrich API instead, replace the `lookupCompany()` function in `server.js`. This requires a ZoomInfo API license.
-- **In-memory cache**: The company cache resets on server restart. For multiple instances or persistence, replace the Map with Redis.
-- **Privacy**: Enriching personal data (names, emails, job titles) falls under GDPR/CCPA regulations. Ensure your team's use of this tool is documented in your privacy policy and that you have a legitimate business interest for processing this data.
-- **No database**: This tool does not store lead data. Results are returned in real-time and not persisted.
-
-## Project structure
-
-```
-├── server.js          # Express backend with API routes
-├── package.json       # Dependencies and scripts
-├── .env.example       # Environment variable template
-├── README.md          # This file
-├── index.html         # Vite entry point
-├── src/
-│   ├── App.tsx        # React frontend
-│   ├── main.tsx       # React entry point
-│   └── index.css      # Global styles
-├── vite.config.js     # Vite configuration
-└── dist/              # Built frontend (generated by npm run build)
-```
+MIT
