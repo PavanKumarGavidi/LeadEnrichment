@@ -1,16 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
-const ENRICHLOOPS_API_KEY = 'ek_8d4895a40ac852a80d4a511a2a9e8c3adffe7e8e4c62b964';
-const ENRICHLOOPS_BASE_URL = 'https://api.enrichloops.com/v1';
 const TEAM_PASSWORD = 'demo123';
-
-// CORS proxies to try (Enrichloops blocks direct browser requests)
-const CORS_PROXIES = [
-  (url: string) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://cors.isomorphic-git.org/${url}`,
-];
 
 // ─── Personal/free email domains ─────────────────────────────────────────────
 const PERSONAL_DOMAINS = new Set([
@@ -85,172 +76,57 @@ interface DebugLog {
   details?: string;
 }
 
-// ─── CORS-friendly fetch ─────────────────────────────────────────────────────
-async function fetchWithCorsProxy(
-  url: string,
-  options: RequestInit,
+// ─── Netlify Function API call ───────────────────────────────────────────────
+async function callEnrichFunction(
+  name: string,
+  email: string,
   addDebug: (log: DebugLog) => void
-): Promise<Response> {
-  // First try direct (in case CORS is allowed)
+): Promise<{ person: any; company: any }> {
+  const domain = email.split('@')[1].toLowerCase();
+  
+  addDebug({
+    timestamp: new Date().toISOString(),
+    message: 'Calling Netlify Function',
+    details: `POST /api/enrich with email: ${email}`
+  });
+
   try {
-    const directRes = await fetch(url, {
-      ...options,
-      signal: AbortSignal.timeout(8000),
+    const res = await fetch('/api/enrich', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name, email, domain }),
     });
-    addDebug({ timestamp: new Date().toISOString(), message: 'Direct request succeeded', details: `Status: ${directRes.status}` });
-    return directRes;
+
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(error.error || `API error: ${res.status}`);
+    }
+
+    const data = await res.json();
+    
+    addDebug({
+      timestamp: new Date().toISOString(),
+      message: 'Netlify Function responded',
+      details: `Person: ${!!data.person}, Company: ${!!data.company}`
+    });
+
+    return data;
   } catch (err: any) {
-    addDebug({ timestamp: new Date().toISOString(), message: 'Direct request failed (CORS?)', details: err.message });
-  }
-
-  // Try each CORS proxy
-  for (let i = 0; i < CORS_PROXIES.length; i++) {
-    const proxyFn = CORS_PROXIES[i];
-    const proxyUrl = proxyFn(url);
-    addDebug({ timestamp: new Date().toISOString(), message: `Trying proxy ${i + 1}/${CORS_PROXIES.length}`, details: proxyUrl.substring(0, 100) });
-
-    try {
-      const res = await fetch(proxyUrl, {
-        ...options,
-        signal: AbortSignal.timeout(15000),
-      });
-      addDebug({ timestamp: new Date().toISOString(), message: `Proxy ${i + 1} responded`, details: `Status: ${res.status}` });
-      return res;
-    } catch (err: any) {
-      addDebug({ timestamp: new Date().toISOString(), message: `Proxy ${i + 1} failed`, details: err.message });
-      if (i === CORS_PROXIES.length - 1) {
-        throw new Error('ALL_PROXIES_FAILED');
-      }
-    }
-  }
-
-  throw new Error('ALL_PROXIES_FAILED');
-}
-
-// ─── Enrichloops API helpers ─────────────────────────────────────────────────
-async function enrichloopsRequest(
-  endpoint: string,
-  body: any,
-  addDebug: (log: DebugLog) => void
-): Promise<any> {
-  const url = `${ENRICHLOOPS_BASE_URL}${endpoint}`;
-  addDebug({ timestamp: new Date().toISOString(), message: `POST ${endpoint}`, details: JSON.stringify(body) });
-
-  const res = await fetchWithCorsProxy(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${ENRICHLOOPS_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  }, addDebug);
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    addDebug({ timestamp: new Date().toISOString(), message: `API error ${res.status}`, details: text.substring(0, 500) });
-    throw new Error(`API error: ${res.status} - ${text.substring(0, 200)}`);
-  }
-
-  const data = await res.json();
-  addDebug({ timestamp: new Date().toISOString(), message: 'Response received', details: JSON.stringify(data).substring(0, 500) });
-  return data;
-}
-
-async function pollTask(
-  taskId: string,
-  maxAttempts: number,
-  addDebug: (log: DebugLog) => void
-): Promise<any> {
-  for (let i = 0; i < maxAttempts; i++) {
-    addDebug({ timestamp: new Date().toISOString(), message: `Polling task (attempt ${i + 1}/${maxAttempts})` });
-
-    try {
-      const res = await fetchWithCorsProxy(`${ENRICHLOOPS_BASE_URL}/tasks/${taskId}`, {
-        headers: {
-          'Authorization': `Bearer ${ENRICHLOOPS_API_KEY}`,
-        },
-      }, addDebug);
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        addDebug({ timestamp: new Date().toISOString(), message: `Poll error ${res.status}`, details: text.substring(0, 300) });
-        throw new Error(`Poll failed: ${res.status}`);
-      }
-
-      const data = await res.json();
-      addDebug({ timestamp: new Date().toISOString(), message: `Task status: ${data.task?.status}` });
-
-      if (data.task?.status === 'succeeded') {
-        return data;
-      }
-
-      if (data.task?.status === 'failed') {
-        throw new Error(data.error?.message || 'Enrichment failed');
-      }
-
-      // Still processing, wait 2 seconds
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } catch (err: any) {
-      if (err.message === 'Enrichment failed' || err.message?.startsWith('Poll failed')) {
-        throw err;
-      }
-      if (i === maxAttempts - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-  }
-
-  throw new Error('Task polling timeout');
-}
-
-async function enrichCompany(domain: string, addDebug: (log: DebugLog) => void): Promise<any> {
-  try {
-    const response = await enrichloopsRequest('/companies/enrich', { domain }, addDebug);
-
-    if (response.task?.status === 'succeeded') {
-      return response.data;
-    }
-
-    if (response.task?.id) {
-      const result = await pollTask(response.task.id, 15, addDebug);
-      return result.data;
-    }
-
-    return null;
-  } catch (err: any) {
-    addDebug({ timestamp: new Date().toISOString(), message: 'Company enrichment error', details: err.message });
-    return null;
-  }
-}
-
-async function enrichPerson(email: string, fullName: string | undefined, addDebug: (log: DebugLog) => void): Promise<any> {
-  try {
-    const body: any = { email };
-    if (fullName) body.fullName = fullName;
-
-    const response = await enrichloopsRequest('/people/enrich', body, addDebug);
-
-    if (response.task?.status === 'succeeded') {
-      return response.data;
-    }
-
-    if (response.task?.id) {
-      const result = await pollTask(response.task.id, 15, addDebug);
-      return result.data;
-    }
-
-    return null;
-  } catch (err: any) {
-    addDebug({ timestamp: new Date().toISOString(), message: 'Person enrichment error', details: err.message });
-    return null;
+    addDebug({
+      timestamp: new Date().toISOString(),
+      message: 'Netlify Function error',
+      details: err.message
+    });
+    throw err;
   }
 }
 
 // ─── FREE FALLBACK DATA SOURCES ──────────────────────────────────────────────
 async function getGravatar(email: string): Promise<string | null> {
   try {
-    // Use simple hash for Gravatar (MD5)
     const emailLower = email.trim().toLowerCase();
-    // Simple MD5-like hash using SubtleCrypto (SHA-256 works as fallback)
     const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(emailLower));
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
@@ -307,19 +183,21 @@ async function enrichLead(
     addDebug({ timestamp: new Date().toISOString(), message: 'Company found in cache' });
   }
 
-  // Run all lookups in parallel
-  const [enrichloopsPerson, enrichloopsCompany, gravatar, github, wikipedia] = await Promise.all([
-    enrichPerson(email, name, addDebug),
-    cachedCompany ? Promise.resolve(null) : enrichCompany(domain, addDebug),
+  // Run Netlify Function + free APIs in parallel
+  const [enrichData, gravatar, github, wikipedia] = await Promise.all([
+    cachedCompany ? Promise.resolve({ person: null, company: cachedCompany }) : callEnrichFunction(name, email, addDebug),
     getGravatar(email),
     searchGitHub(name),
     cachedCompany ? Promise.resolve(null) : searchWikipedia(domain.split('.')[0]),
   ]);
 
+  const enrichloopsPerson = enrichData.person;
+  let enrichloopsCompany = enrichData.company;
+
   addDebug({
     timestamp: new Date().toISOString(),
     message: 'All lookups complete',
-    details: `Person: ${!!enrichloopsPerson}, Company: ${!!enrichloopsCompany}, GitHub: ${!!github}, Wiki: ${!!wikipedia}`
+    details: `Enrichloops Person: ${!!enrichloopsPerson}, Enrichloops Company: ${!!enrichloopsCompany}, GitHub: ${!!github}, Wiki: ${!!wikipedia}`
   });
 
   // Build person data
