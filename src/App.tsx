@@ -1,23 +1,57 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-// Types
+// ─── Configuration ───────────────────────────────────────────────────────────
+const APOLLO_API_KEY = 'UhKB7c0hM4t2Ep1ihvRBRg';
+const TEAM_PASSWORD = 'demo123';
+
+// ─── Personal/free email domains ─────────────────────────────────────────────
+const PERSONAL_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com',
+  'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
+  'icloud.com', 'me.com', 'aol.com', 'proton.me',
+  'protonmail.com', 'gmx.com', 'mail.com', 'zoho.com',
+  'yandex.com', 'qq.com', '163.com',
+]);
+
+// ─── Company cache (24h TTL) ─────────────────────────────────────────────────
+const companyCache = new Map<string, { data: any; expiresAt: number }>();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function getCachedCompany(domain: string) {
+  const entry = companyCache.get(domain);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expiresAt) {
+    companyCache.delete(domain);
+    return undefined;
+  }
+  return entry.data;
+}
+
+function setCachedCompany(domain: string, data: any) {
+  companyCache.set(domain, {
+    data,
+    expiresAt: Date.now() + CACHE_TTL_MS,
+  });
+}
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 interface PersonData {
-  name: string;
-  title: string;
-  seniority: string;
-  linkedin: string;
-  location: string;
+  name: string | null;
+  title: string | null;
+  seniority: string | null;
+  linkedin: string | null;
+  location: string | null;
 }
 
 interface CompanyData {
-  name: string;
-  website: string;
-  industry: string;
-  employees: string;
-  revenue: string;
+  name: string | null;
+  website: string | null;
+  industry: string | null;
+  employees: string | null;
+  revenue: string | null;
   revenueValue: number | null;
-  linkedin: string;
-  location: string;
+  linkedin: string | null;
+  location: string | null;
 }
 
 interface MatchedFlags {
@@ -32,78 +66,94 @@ interface EnrichResult {
   matched: MatchedFlags;
 }
 
-// ─── Demo mode ───────────────────────────────────────────────────────────────
-// When the Express server isn't running (e.g. static hosting), the app falls
-// back to demo mode so you can explore the full UI.
-const DEMO_PASSWORD = 'demo123';
+// ─── Apollo API helpers ──────────────────────────────────────────────────────
+async function lookupPerson(name: string, email: string) {
+  const url = 'https://api.apollo.io/api/v1/people/match';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
-const DEMO_DATA: Record<string, EnrichResult> = {
-  default: {
-    input: { name: '', email: '', domain: '' },
-    person: {
-      name: '',
-      title: 'VP of Sales',
-      seniority: 'VP',
-      linkedin: 'https://www.linkedin.com/in/example',
-      location: 'San Francisco, California, United States',
-    },
-    company: {
-      name: 'Acme Corporation',
-      website: 'https://www.acmecorp.com',
-      industry: 'Software',
-      employees: '250',
-      revenue: '$50M',
-      revenueValue: 50000000,
-      linkedin: 'https://www.linkedin.com/company/acme-corp',
-      location: 'San Francisco, California, United States',
-    },
-    matched: { person: true, company: true },
-  },
-};
-
-function generateDemoResult(name: string, email: string): EnrichResult {
-  const domain = email.split('@')[1] || 'example.com';
-  const companyName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
-  const firstName = name.split(' ')[0] || 'User';
-
-  return {
-    input: { name, email, domain },
-    person: {
-      name,
-      title: 'Director of ' + ['Sales', 'Marketing', 'Engineering', 'Operations', 'Product'][Math.floor(Math.random() * 5)],
-      seniority: ['Director', 'VP', 'Manager', 'Senior Manager'][Math.floor(Math.random() * 4)],
-      linkedin: `https://www.linkedin.com/in/${firstName.toLowerCase()}-${domain.split('.')[0]}`,
-      location: ['San Francisco, California, United States', 'New York, New York, United States', 'Austin, Texas, United States', 'London, England, United Kingdom', 'Berlin, Germany'][Math.floor(Math.random() * 5)],
-    },
-    company: {
-      name: `${companyName.charAt(0).toUpperCase() + companyName.slice(1)} Inc.`,
-      website: `https://www.${domain}`,
-      industry: ['Software', 'Financial Services', 'Healthcare', 'Marketing', 'Manufacturing'][Math.floor(Math.random() * 5)],
-      employees: String([50, 120, 500, 1200, 5000][Math.floor(Math.random() * 5)]),
-      revenue: ['$10M', '$25M', '$50M', '$100M', '$250M'][Math.floor(Math.random() * 5)],
-      revenueValue: [10000000, 25000000, 50000000, 100000000, 250000000][Math.floor(Math.random() * 5)],
-      linkedin: `https://www.linkedin.com/company/${domain.split('.')[0]}`,
-      location: ['San Francisco, California, United States', 'New York, New York, United States', 'Austin, Texas, United States'][Math.floor(Math.random() * 3)],
-    },
-    matched: { person: true, company: true },
-  };
-}
-
-// ─── API helper (with demo fallback) ─────────────────────────────────────────
-let isDemoMode = false;
-
-async function apiCall(url: string, options?: RequestInit): Promise<Response> {
   try {
-    const res = await fetch(url, options);
-    return res;
-  } catch {
-    // Server not available - switch to demo mode
-    isDemoMode = true;
-    throw new Error('DEMO_MODE');
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'x-api-key': APOLLO_API_KEY,
+      },
+      body: JSON.stringify({ name, email }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (response.status === 429) {
+      throw new Error('RATE_LIMIT');
+    }
+
+    if (!response.ok) {
+      if (response.status === 404) return null;
+      throw new Error('APOLLO_ERROR');
+    }
+
+    const data = await response.json();
+    return data.person || null;
+  } catch (err: any) {
+    clearTimeout(timeout);
+    if (err.message === 'RATE_LIMIT') throw err;
+    if (err.name === 'AbortError') throw new Error('TIMEOUT');
+    if (err.name === 'TypeError' && err.message.includes('fetch')) {
+      throw new Error('CORS_ERROR');
+    }
+    throw err;
   }
 }
 
-// Login View
+async function lookupCompany(domain: string) {
+  const url = `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'x-api-key': APOLLO_API_KEY,
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (response.status === 429) {
+      throw new Error('RATE_LIMIT');
+    }
+
+    if (!response.ok) {
+      if (response.status === 404) return null;
+      throw new Error('APOLLO_ERROR');
+    }
+
+    const data = await response.json();
+    return data.organization || null;
+  } catch (err: any) {
+    clearTimeout(timeout);
+    if (err.message === 'RATE_LIMIT') throw err;
+    if (err.name === 'AbortError') return null;
+    if (err.name === 'TypeError' && err.message.includes('fetch')) {
+      throw new Error('CORS_ERROR');
+    }
+    return null;
+  }
+}
+
+function joinLocation(city: string, state: string, country: string) {
+  const parts = [city, state, country].filter(Boolean);
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+// ─── Login View ──────────────────────────────────────────────────────────────
 function LoginView({ onLogin }: { onLogin: () => void }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -114,9 +164,9 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
     setError('');
     setLoading(true);
 
-    // Try real API first
+    // Try backend first
     try {
-      const res = await apiCall('/api/login', {
+      const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),
@@ -128,12 +178,11 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
       const data = await res.json();
       setError(data.error || 'Invalid password');
     } catch {
-      // Demo mode fallback
-      if (password === DEMO_PASSWORD) {
-        isDemoMode = true;
+      // No backend - check password client-side
+      if (password === TEAM_PASSWORD) {
         onLogin();
       } else {
-        setError('Invalid password. (Demo password: demo123)');
+        setError('Invalid password');
       }
     } finally {
       setLoading(false);
@@ -173,18 +222,13 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
               {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
-          <div className="mt-5 pt-4 border-t border-[--color-border]">
-            <p className="text-xs text-[--color-muted] text-center">
-              Demo mode — use password: <code className="bg-gray-100 px-1.5 py-0.5 rounded font-mono text-[--color-teal]">demo123</code>
-            </p>
-          </div>
         </div>
       </div>
     </div>
   );
 }
 
-// Result field component
+// ─── Result field component ──────────────────────────────────────────────────
 function FieldRow({ label, value, link }: { label: string; value: string | null; link?: string }) {
   return (
     <div className="flex flex-col sm:flex-row sm:items-baseline py-2 border-b border-gray-100 last:border-b-0">
@@ -213,7 +257,7 @@ function FieldRow({ label, value, link }: { label: string; value: string | null;
   );
 }
 
-// App View
+// ─── App View ────────────────────────────────────────────────────────────────
 function AppView({ onLogout }: { onLogout: () => void }) {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -229,46 +273,96 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     setLoading(true);
     setResult(null);
 
-    // Try real API
+    // Validate input
+    if (!name.trim()) {
+      setError('Name is required');
+      setLoading(false);
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      setError('A valid email address is required');
+      setLoading(false);
+      return;
+    }
+
+    const domain = email.split('@')[1].toLowerCase();
+
+    // Check personal domain
+    if (PERSONAL_DOMAINS.has(domain)) {
+      setError('Personal email addresses (Gmail, Yahoo, etc.) are not supported. Please provide a work email address.');
+      setLoading(false);
+      return;
+    }
+
     try {
-      const res = await apiCall('/api/enrich', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email }),
-      });
-      const data = await res.json();
-      if (res.status === 401) {
-        onLogout();
-        return;
+      // Check cache
+      const cachedCompany = getCachedCompany(domain);
+
+      // Parallel lookups
+      const personPromise = lookupPerson(name.trim(), email.trim());
+      const companyPromise = cachedCompany !== undefined
+        ? Promise.resolve(cachedCompany)
+        : lookupCompany(domain);
+
+      const [personResult, companyResult] = await Promise.all([
+        personPromise,
+        companyPromise,
+      ]);
+
+      // Cache company result
+      if (cachedCompany === undefined && companyResult !== null) {
+        setCachedCompany(domain, companyResult);
       }
-      if (!res.ok) {
-        setError(data.error || 'Something went wrong');
-        return;
+
+      let person = personResult;
+      let company = companyResult;
+
+      // Fallback: use person.organization if company lookup returned nothing
+      if (!company && person && person.organization) {
+        company = person.organization;
       }
-      setResult(data);
-    } catch {
-      // Demo mode fallback
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!name.trim()) {
-        setError('Name is required');
-        setLoading(false);
-        return;
+
+      // Build response
+      const response: EnrichResult = {
+        input: { name: name.trim(), email: email.trim(), domain },
+        person: person ? {
+          name: person.name || null,
+          title: person.title || null,
+          seniority: person.seniority || null,
+          linkedin: person.linkedin_url || null,
+          location: joinLocation(person.city, person.state, person.country),
+        } : null,
+        company: company ? {
+          name: company.name || null,
+          website: company.website_url || null,
+          industry: company.industry || null,
+          employees: company.estimated_num_employees
+            ? company.estimated_num_employees.toLocaleString('en-US')
+            : null,
+          revenue: company.annual_revenue_printed || null,
+          revenueValue: company.annual_revenue || null,
+          linkedin: company.linkedin_url || null,
+          location: joinLocation(company.city, company.state, company.country),
+        } : null,
+        matched: {
+          person: !!person,
+          company: !!company,
+        },
+      };
+
+      setResult(response);
+    } catch (err: any) {
+      if (err.message === 'RATE_LIMIT') {
+        setError('Rate limit reached. Please try again shortly.');
+      } else if (err.message === 'CORS_ERROR') {
+        setError('Cannot connect to Apollo API from browser. Please run the backend server with: node server.js');
+      } else if (err.message === 'TIMEOUT') {
+        setError('Request timed out. Please try again.');
+      } else {
+        setError('Could not retrieve data from the enrichment service. Please try again.');
       }
-      if (!emailRegex.test(email)) {
-        setError('A valid email address is required');
-        setLoading(false);
-        return;
-      }
-      const domain = email.split('@')[1].toLowerCase();
-      const personalDomains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'icloud.com'];
-      if (personalDomains.includes(domain)) {
-        setError('Personal email addresses (Gmail, Yahoo, etc.) are not supported. Please provide a work email address.');
-        setLoading(false);
-        return;
-      }
-      // Simulate API delay
-      await new Promise(r => setTimeout(r, 800));
-      setResult(generateDemoResult(name.trim(), email.trim()));
     } finally {
       setLoading(false);
     }
@@ -299,11 +393,10 @@ function AppView({ onLogout }: { onLogout: () => void }) {
   const handleLogout = async () => {
     try {
       await fetch('/api/logout', { method: 'POST' });
-    } catch { /* demo mode - ignore */ }
+    } catch { /* ignore */ }
     onLogout();
   };
 
-  // Determine warning message
   const getWarning = () => {
     if (!result) return null;
     if (!result.matched.person && !result.matched.company) {
@@ -320,38 +413,20 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
   return (
     <div className="min-h-screen">
-      {/* Header */}
       <header className="bg-white border-b border-[--color-border] px-4 py-3">
         <div className="max-w-5xl mx-auto flex items-center justify-between">
           <h1 className="text-lg font-semibold text-[--color-teal]">Lead lookup</h1>
-          <div className="flex items-center gap-3">
-            {isDemoMode && (
-              <span className="text-xs bg-amber-100 text-amber-800 px-2 py-1 rounded font-medium">
-                Demo mode
-              </span>
-            )}
-            <button
-              onClick={handleLogout}
-              className="text-sm text-[--color-muted] hover:text-[--color-teal] focus:outline-none focus:ring-2 focus:ring-[--color-teal] rounded px-2 py-1 cursor-pointer"
-            >
-              Sign out
-            </button>
-          </div>
+          <button
+            onClick={handleLogout}
+            className="text-sm text-[--color-muted] hover:text-[--color-teal] focus:outline-none focus:ring-2 focus:ring-[--color-teal] rounded px-2 py-1 cursor-pointer"
+          >
+            Sign out
+          </button>
         </div>
       </header>
 
-      {/* Main content */}
       <main className="max-w-5xl mx-auto p-4 sm:p-6">
-        {isDemoMode && (
-          <div className="mb-4 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
-            <p className="text-sm text-blue-800">
-              <strong>Demo mode active.</strong> The backend server isn't connected — results are simulated. To use with real data, run <code className="bg-blue-100 px-1 rounded font-mono text-xs">node server.js</code> with your Apollo API key configured.
-            </p>
-          </div>
-        )}
-
         <div className="flex flex-col lg:flex-row gap-6">
-          {/* Form panel */}
           <div className="w-full lg:w-80 shrink-0">
             <div className="bg-white border border-[--color-border] rounded-lg p-5">
               <form onSubmit={handleLookup}>
@@ -397,7 +472,6 @@ function AppView({ onLogout }: { onLogout: () => void }) {
             </div>
           </div>
 
-          {/* Results panel */}
           <div className={`flex-1 ${loading ? 'opacity-50' : ''}`}>
             {error && (
               <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
@@ -407,7 +481,6 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
             {result && (
               <div className="bg-white border border-[--color-border] rounded-lg">
-                {/* Result header */}
                 <div className="px-5 py-4 border-b border-[--color-border] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
                   <div>
                     <h2 className="text-base font-semibold text-gray-900">
@@ -423,14 +496,12 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                   </button>
                 </div>
 
-                {/* Warning banner */}
                 {getWarning() && (
                   <div className="mx-5 mt-4 bg-amber-50 border border-amber-200 rounded-md px-4 py-2.5">
                     <p className="text-sm text-amber-800">{getWarning()}</p>
                   </div>
                 )}
 
-                {/* Person section */}
                 <div className="px-5 py-4">
                   <h3 className="text-xs font-semibold text-[--color-muted] uppercase tracking-wider mb-2">
                     Person
@@ -445,7 +516,6 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                   <FieldRow label="Location" value={result.person?.location || null} />
                 </div>
 
-                {/* Company section */}
                 <div className="px-5 py-4 border-t border-[--color-border]">
                   <h3 className="text-xs font-semibold text-[--color-muted] uppercase tracking-wider mb-2">
                     Company
@@ -490,19 +560,15 @@ function AppView({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-// Main App
+// ─── Main App ────────────────────────────────────────────────────────────────
 export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
 
   useEffect(() => {
-    // Try to check session with real server
     fetch('/api/session')
       .then(res => res.json())
       .then(data => setAuthed(data.authed === true))
-      .catch(() => {
-        // Server not available - show login (will enter demo mode on login)
-        setAuthed(false);
-      });
+      .catch(() => setAuthed(false));
   }, []);
 
   if (authed === null) {
