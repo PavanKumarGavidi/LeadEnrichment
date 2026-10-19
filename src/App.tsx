@@ -4,6 +4,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 const APOLLO_API_KEY = 'UhKB7c0hM4t2Ep1ihvRBRg';
 const TEAM_PASSWORD = 'demo123';
 
+// CORS proxy to allow browser → Apollo API calls
+// Apollo blocks direct browser requests (CORS), so we route through a proxy
+const CORS_PROXY = 'https://corsproxy.io/?url=';
+
 // ─── Personal/free email domains ─────────────────────────────────────────────
 const PERSONAL_DOMAINS = new Set([
   'gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com',
@@ -66,14 +70,48 @@ interface EnrichResult {
   matched: MatchedFlags;
 }
 
-// ─── Apollo API helpers ──────────────────────────────────────────────────────
-async function lookupPerson(name: string, email: string) {
-  const url = 'https://api.apollo.io/api/v1/people/match';
+// ─── Apollo API helpers (via CORS proxy) ─────────────────────────────────────
+async function apolloFetch(url: string, options: RequestInit) {
+  // Try backend first (if server.js is running)
+  try {
+    const backendUrl = url.replace('https://api.apollo.io', '/api/apollo-proxy');
+    const res = await fetch(backendUrl, {
+      ...options,
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok || res.status === 404 || res.status === 429) {
+      return res;
+    }
+  } catch {
+    // Backend not available, use CORS proxy
+  }
+
+  // Fallback: use CORS proxy
+  const proxyUrl = CORS_PROXY + encodeURIComponent(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
-    const response = await fetch(url, {
+    const res = await fetch(proxyUrl, {
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    return res;
+  } catch (err: any) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      throw new Error('TIMEOUT');
+    }
+    throw new Error('NETWORK_ERROR');
+  }
+}
+
+async function lookupPerson(name: string, email: string) {
+  const url = 'https://api.apollo.io/api/v1/people/match';
+
+  try {
+    const response = await apolloFetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -81,10 +119,7 @@ async function lookupPerson(name: string, email: string) {
         'x-api-key': APOLLO_API_KEY,
       },
       body: JSON.stringify({ name, email }),
-      signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     if (response.status === 429) {
       throw new Error('RATE_LIMIT');
@@ -92,39 +127,32 @@ async function lookupPerson(name: string, email: string) {
 
     if (!response.ok) {
       if (response.status === 404) return null;
+      const text = await response.text().catch(() => '');
+      console.error('Apollo person error:', response.status, text);
       throw new Error('APOLLO_ERROR');
     }
 
     const data = await response.json();
     return data.person || null;
   } catch (err: any) {
-    clearTimeout(timeout);
     if (err.message === 'RATE_LIMIT') throw err;
-    if (err.name === 'AbortError') throw new Error('TIMEOUT');
-    if (err.name === 'TypeError' && err.message.includes('fetch')) {
-      throw new Error('CORS_ERROR');
-    }
-    throw err;
+    if (err.message === 'TIMEOUT' || err.message === 'NETWORK_ERROR') throw err;
+    return null;
   }
 }
 
 async function lookupCompany(domain: string) {
   const url = `https://api.apollo.io/api/v1/organizations/enrich?domain=${encodeURIComponent(domain)}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
-    const response = await fetch(url, {
+    const response = await apolloFetch(url, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
         'x-api-key': APOLLO_API_KEY,
       },
-      signal: controller.signal,
     });
-
-    clearTimeout(timeout);
 
     if (response.status === 429) {
       throw new Error('RATE_LIMIT');
@@ -132,19 +160,17 @@ async function lookupCompany(domain: string) {
 
     if (!response.ok) {
       if (response.status === 404) return null;
-      throw new Error('APOLLO_ERROR');
+      const text = await response.text().catch(() => '');
+      console.error('Apollo company error:', response.status, text);
+      return null; // failure-tolerant
     }
 
     const data = await response.json();
     return data.organization || null;
   } catch (err: any) {
-    clearTimeout(timeout);
     if (err.message === 'RATE_LIMIT') throw err;
-    if (err.name === 'AbortError') return null;
-    if (err.name === 'TypeError' && err.message.includes('fetch')) {
-      throw new Error('CORS_ERROR');
-    }
-    return null;
+    if (err.message === 'TIMEOUT' || err.message === 'NETWORK_ERROR') throw err;
+    return null; // failure-tolerant
   }
 }
 
@@ -164,12 +190,12 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
     setError('');
     setLoading(true);
 
-    // Try backend first
     try {
       const res = await fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),
+        signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {
         onLogin();
@@ -178,7 +204,7 @@ function LoginView({ onLogin }: { onLogin: () => void }) {
       const data = await res.json();
       setError(data.error || 'Invalid password');
     } catch {
-      // No backend - check password client-side
+      // No backend — check password client-side
       if (password === TEAM_PASSWORD) {
         onLogin();
       } else {
@@ -265,11 +291,13 @@ function AppView({ onLogout }: { onLogout: () => void }) {
   const [result, setResult] = useState<EnrichResult | null>(null);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [debugInfo, setDebugInfo] = useState('');
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const handleLookup = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setDebugInfo('');
     setLoading(true);
     setResult(null);
 
@@ -297,6 +325,8 @@ function AppView({ onLogout }: { onLogout: () => void }) {
     }
 
     try {
+      setDebugInfo('Connecting to Apollo API…');
+
       // Check cache
       const cachedCompany = getCachedCompany(domain);
 
@@ -305,6 +335,8 @@ function AppView({ onLogout }: { onLogout: () => void }) {
       const companyPromise = cachedCompany !== undefined
         ? Promise.resolve(cachedCompany)
         : lookupCompany(domain);
+
+      setDebugInfo('Fetching person and company data…');
 
       const [personResult, companyResult] = await Promise.all([
         personPromise,
@@ -323,6 +355,8 @@ function AppView({ onLogout }: { onLogout: () => void }) {
       if (!company && person && person.organization) {
         company = person.organization;
       }
+
+      setDebugInfo('');
 
       // Build response
       const response: EnrichResult = {
@@ -354,14 +388,15 @@ function AppView({ onLogout }: { onLogout: () => void }) {
 
       setResult(response);
     } catch (err: any) {
+      setDebugInfo('');
       if (err.message === 'RATE_LIMIT') {
-        setError('Rate limit reached. Please try again shortly.');
-      } else if (err.message === 'CORS_ERROR') {
-        setError('Cannot connect to Apollo API from browser. Please run the backend server with: node server.js');
+        setError('Rate limit reached on Apollo API. Please wait a moment and try again.');
       } else if (err.message === 'TIMEOUT') {
-        setError('Request timed out. Please try again.');
+        setError('Request timed out. The enrichment service may be slow. Please try again.');
+      } else if (err.message === 'NETWORK_ERROR') {
+        setError('Network error — could not reach the enrichment service. Please check your connection and try again.');
       } else {
-        setError('Could not retrieve data from the enrichment service. Please try again.');
+        setError('Could not retrieve data. Please try again.');
       }
     } finally {
       setLoading(false);
@@ -440,7 +475,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     className="w-full px-3 py-2 border border-[--color-border] rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-[--color-teal] focus:border-transparent"
-                    placeholder="e.g. Jane Smith"
+                    placeholder="e.g. Satya Nadella"
                     required
                   />
                 </div>
@@ -454,7 +489,7 @@ function AppView({ onLogout }: { onLogout: () => void }) {
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full px-3 py-2 border border-[--color-border] rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-[--color-teal] focus:border-transparent"
-                    placeholder="e.g. jane@acme.com"
+                    placeholder="e.g. satya@microsoft.com"
                     required
                   />
                 </div>
@@ -475,7 +510,14 @@ function AppView({ onLogout }: { onLogout: () => void }) {
           <div className={`flex-1 ${loading ? 'opacity-50' : ''}`}>
             {error && (
               <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
-                <p className="text-sm text-red-700">{error}</p>
+                <p className="text-sm text-red-700 font-medium">Error</p>
+                <p className="text-sm text-red-700 mt-1">{error}</p>
+              </div>
+            )}
+
+            {debugInfo && (
+              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                <p className="text-sm text-blue-700">{debugInfo}</p>
               </div>
             )}
 
@@ -565,7 +607,7 @@ export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
 
   useEffect(() => {
-    fetch('/api/session')
+    fetch('/api/session', { signal: AbortSignal.timeout(3000) })
       .then(res => res.json())
       .then(data => setAuthed(data.authed === true))
       .catch(() => setAuthed(false));

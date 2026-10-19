@@ -360,6 +360,43 @@ function joinLocation(city, state, country) {
   return parts.length > 0 ? parts.join(', ') : null;
 }
 
+// ─── Apollo proxy (for when backend is running) ──────────────────────────────
+// This lets the frontend call Apollo through the backend, avoiding CORS issues
+app.all('/api/apollo-proxy/*', requireAuth, async (req, res) => {
+  try {
+    const apolloPath = req.params[0] || '';
+    const targetUrl = `https://api.apollo.io/${apolloPath}${req.url.includes('?') ? '?' + req.url.split('?')[1] : ''}`;
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const fetchOptions = {
+      method: req.method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-cache',
+        'x-api-key': APOLLO_API_KEY,
+      },
+      signal: controller.signal,
+    };
+
+    if (req.method === 'POST' && req.body) {
+      fetchOptions.body = JSON.stringify(req.body);
+    }
+
+    const response = await fetch(targetUrl, fetchOptions);
+    clearTimeout(timeout);
+
+    const data = await response.text();
+    res.status(response.status);
+    res.set('Content-Type', 'application/json');
+    res.send(data);
+  } catch (err) {
+    console.error('Apollo proxy error:', err.message);
+    res.status(502).json({ error: 'Could not reach Apollo API' });
+  }
+});
+
 // ─── Serve static files ──────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'dist')));
 
